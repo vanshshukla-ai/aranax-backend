@@ -3,28 +3,30 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import { VertexAI } from '@google-cloud/vertexai';
+import speech from '@google-cloud/speech';
 
 const app = express();
 
-// Vertex AI (Gemini) for AI features — doctor pitch, meeting notes
+
 const vertex = new VertexAI({ project: process.env.GCP_PROJECT || 'direct-tribute-502305-q5', location: 'us-central1' });
 const genModel = vertex.getGenerativeModel({ model: 'gemini-2.5-flash' });
+const speechClient = new speech.SpeechClient();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
 
 const pool = new pg.Pool({
   user: process.env.DB_USER,
   database: process.env.DB_NAME,
   password: process.env.DB_PASSWORD,
-  host: process.env.DB_HOST,   // /cloudsql/<connection-name>
+  host: process.env.DB_HOST,   
 });
 
 const nid = (p) => p + Date.now().toString().slice(-8) + Math.floor(Math.random() * 90 + 10);
 
-// Health
+
 app.get('/', (req, res) => res.json({ ok: true, service: 'aranax-field-force' }));
 
-// ---------- REP PROFILE ----------
+
 app.get('/reps/:id', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT user_id, full_name, email, phone, role, region FROM users WHERE user_id = $1', [req.params.id]);
@@ -33,7 +35,7 @@ app.get('/reps/:id', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ---------- DAILY CLIENT LIST (today's plan for a rep) ----------
+
 app.get('/reps/:id/today', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -51,13 +53,13 @@ app.get('/reps/:id/today', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ---------- CHECK-IN ----------
+
 app.post('/visits/checkin', async (req, res) => {
   try {
     const { rep_id, client_id, assignment_id, lat, lng } = req.body;
     if (!rep_id || !client_id) return res.status(400).json({ error: 'rep_id and client_id required' });
 
-    // geo-validate: distance to client vs geofence radius
+   
     const c = await pool.query('SELECT latitude, longitude, geofence_radius FROM clients WHERE client_id = $1', [client_id]);
     let geo_validated = false;
     if (c.rows.length && lat != null && lng != null) {
@@ -75,7 +77,7 @@ app.post('/visits/checkin', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ---------- CHECK-OUT ----------
+
 app.post('/visits/:id/checkout', async (req, res) => {
   try {
     const v = await pool.query('SELECT checkin_at FROM visits WHERE visit_id = $1', [req.params.id]);
@@ -85,13 +87,13 @@ app.post('/visits/:id/checkout', async (req, res) => {
       `UPDATE visits SET checkout_at = NOW(), duration_min = $1, status = 'COMPLETED' WHERE visit_id = $2`,
       [mins, req.params.id]
     );
-    // mark the assignment done
+  
     await pool.query(`UPDATE assignments SET status = 'DONE' WHERE assignment_id = (SELECT assignment_id FROM visits WHERE visit_id = $1)`, [req.params.id]);
     return res.json({ ok: true, visit_id: req.params.id, duration_min: mins });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ---------- LOG MEETING NOTES (MoM) ----------
+
 app.post('/visits/:id/mom', async (req, res) => {
   try {
     const { notes } = req.body;
@@ -100,7 +102,7 @@ app.post('/visits/:id/mom', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ---------- SALES ENTRY ----------
+
 app.post('/sales', async (req, res) => {
   try {
     const { visit_id, rep_id, client_id, product, stage, deal_value, notes } = req.body;
@@ -115,7 +117,7 @@ app.post('/sales', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// distance in metres between two lat/lng
+
 function haversine(lat1, lon1, lat2, lon2) {
   const R = 6371000, toRad = (d) => d * Math.PI / 180;
   const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
@@ -123,8 +125,7 @@ function haversine(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
 
-// ---------- MANAGER DASHBOARD ----------
-// Team overview: all reps with today's progress
+
 app.get('/manager/team', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -142,10 +143,10 @@ app.get('/manager/team', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// Live locations of all reps (latest GPS point each) — for the map
+
 app.get('/manager/live', async (req, res) => {
   try {
-    // latest known position per rep (falls back to last check-in if no gps yet)
+
     const { rows } = await pool.query(`
       SELECT u.user_id, u.full_name,
              COALESCE(g.latitude, v.checkin_lat) AS latitude,
@@ -160,7 +161,7 @@ app.get('/manager/live', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// Visit history for a rep (recent visits)
+
 app.get('/manager/reps/:id/visits', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -173,7 +174,7 @@ app.get('/manager/reps/:id/visits', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// Monthly summary for a rep (payroll-ready figures)
+
 app.get('/manager/reps/:id/monthly', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -193,7 +194,7 @@ app.get('/manager/reps/:id/monthly', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ---------- AI: DOCTOR PITCH (Vertex AI / Gemini) ----------
+
 app.post('/ai/doctor-pitch', async (req, res) => {
   try {
     const { doctor_name, specialty, hospital, product, past_interactions } = req.body;
@@ -218,7 +219,7 @@ app.post('/ai/doctor-pitch', async (req, res) => {
   }
 });
 
-// ---------- AI: MEETING NOTES SUMMARY (Vertex AI / Gemini) ----------
+
 app.post('/ai/mom-summary', async (req, res) => {
   try {
     const { notes } = req.body;
@@ -232,6 +233,28 @@ app.post('/ai/mom-summary', async (req, res) => {
     return res.json(parsed);
   } catch (e) {
     return res.status(500).json({ error: 'Could not summarize notes', detail: e.message });
+  }
+});
+
+
+app.post('/ai/transcribe', async (req, res) => {
+  try {
+    const { audioBase64, encoding, sampleRate } = req.body;
+    if (!audioBase64) return res.status(400).json({ error: 'audioBase64 required' });
+    const [result] = await speechClient.recognize({
+      audio: { content: audioBase64 },
+      config: {
+        encoding: encoding || 'WEBM_OPUS',
+        sampleRateHertz: sampleRate || 48000,
+        languageCode: 'en-IN',
+        alternativeLanguageCodes: ['hi-IN', 'en-US'],
+        enableAutomaticPunctuation: true,
+      },
+    });
+    const transcript = (result.results || []).map(r => r.alternatives[0].transcript).join(' ').trim();
+    return res.json({ transcript });
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not transcribe audio', detail: e.message });
   }
 });
 
