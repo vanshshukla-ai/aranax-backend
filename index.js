@@ -8,7 +8,7 @@ const app = express();
 
 // Vertex AI (Gemini) for AI features — doctor pitch, meeting notes
 const vertex = new VertexAI({ project: process.env.GCP_PROJECT || 'direct-tribute-502305-q5', location: 'us-central1' });
-const genModel = vertex.getGenerativeModel({ model: 'gemini-2.0-flash-001' });
+const genModel = vertex.getGenerativeModel({ model: 'gemini-2.5-flash' });
 app.use(cors());
 app.use(express.json());
 
