@@ -2,8 +2,13 @@
 import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
+import { VertexAI } from '@google-cloud/vertexai';
 
 const app = express();
+
+// Vertex AI (Gemini) for AI features — doctor pitch, meeting notes
+const vertex = new VertexAI({ project: process.env.GCP_PROJECT || 'direct-tribute-502305-q5', location: 'us-central1' });
+const genModel = vertex.getGenerativeModel({ model: 'gemini-2.0-flash-001' });
 app.use(cors());
 app.use(express.json());
 
@@ -19,7 +24,7 @@ const nid = (p) => p + Date.now().toString().slice(-8) + Math.floor(Math.random(
 // Health
 app.get('/', (req, res) => res.json({ ok: true, service: 'aranax-field-force' }));
 
-
+// ---------- REP PROFILE ----------
 app.get('/reps/:id', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT user_id, full_name, email, phone, role, region FROM users WHERE user_id = $1', [req.params.id]);
@@ -28,6 +33,7 @@ app.get('/reps/:id', async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
+// ---------- DAILY CLIENT LIST (today's plan for a rep) ----------
 app.get('/reps/:id/today', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -116,6 +122,118 @@ function haversine(lat1, lon1, lat2, lon2) {
   const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
+
+// ---------- MANAGER DASHBOARD ----------
+// Team overview: all reps with today's progress
+app.get('/manager/team', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT u.user_id, u.full_name, u.region,
+             COUNT(DISTINCT a.assignment_id) AS planned,
+             COUNT(DISTINCT CASE WHEN v.status = 'COMPLETED' THEN v.visit_id END) AS completed,
+             COUNT(DISTINCT CASE WHEN v.status = 'IN_PROGRESS' THEN v.visit_id END) AS in_progress
+        FROM users u
+        LEFT JOIN assignments a ON a.rep_id = u.user_id AND a.plan_date = CURRENT_DATE
+        LEFT JOIN visits v ON v.rep_id = u.user_id AND DATE(v.created_at) = CURRENT_DATE
+       WHERE u.role = 'REP'
+       GROUP BY u.user_id, u.full_name, u.region
+       ORDER BY u.full_name`);
+    return res.json({ team: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// Live locations of all reps (latest GPS point each) — for the map
+app.get('/manager/live', async (req, res) => {
+  try {
+    // latest known position per rep (falls back to last check-in if no gps yet)
+    const { rows } = await pool.query(`
+      SELECT u.user_id, u.full_name,
+             COALESCE(g.latitude, v.checkin_lat) AS latitude,
+             COALESCE(g.longitude, v.checkin_lng) AS longitude,
+             v.client_id, c.client_name, v.status AS visit_status
+        FROM users u
+        LEFT JOIN LATERAL (SELECT latitude, longitude FROM gps_logs WHERE rep_id = u.user_id ORDER BY recorded_at DESC LIMIT 1) g ON true
+        LEFT JOIN LATERAL (SELECT client_id, checkin_lat, checkin_lng, status FROM visits WHERE rep_id = u.user_id ORDER BY created_at DESC LIMIT 1) v ON true
+        LEFT JOIN clients c ON c.client_id = v.client_id
+       WHERE u.role = 'REP'`);
+    return res.json({ reps: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// Visit history for a rep (recent visits)
+app.get('/manager/reps/:id/visits', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT v.visit_id, v.checkin_at, v.checkout_at, v.duration_min, v.geo_validated, v.status, v.mom_notes,
+             c.client_name, c.client_type, c.address
+        FROM visits v JOIN clients c ON c.client_id = v.client_id
+       WHERE v.rep_id = $1
+       ORDER BY v.created_at DESC LIMIT 50`, [req.params.id]);
+    return res.json({ visits: rows });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// Monthly summary for a rep (payroll-ready figures)
+app.get('/manager/reps/:id/monthly', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT COUNT(*) AS total_visits,
+             COALESCE(SUM(duration_min),0) AS total_minutes,
+             COUNT(CASE WHEN geo_validated THEN 1 END) AS verified_visits
+        FROM visits
+       WHERE rep_id = $1 AND status = 'COMPLETED'
+         AND date_trunc('month', created_at) = date_trunc('month', CURRENT_DATE)`, [req.params.id]);
+    const r = rows[0] || {};
+    return res.json({
+      rep_id: req.params.id,
+      total_visits: parseInt(r.total_visits || 0, 10),
+      total_hours: Math.round((r.total_minutes || 0) / 60 * 10) / 10,
+      verified_visits: parseInt(r.verified_visits || 0, 10),
+    });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+
+// ---------- AI: DOCTOR PITCH (Vertex AI / Gemini) ----------
+app.post('/ai/doctor-pitch', async (req, res) => {
+  try {
+    const { doctor_name, specialty, hospital, product, past_interactions } = req.body;
+    const facts = [
+      'Doctor: ' + (doctor_name || 'the doctor'),
+      'Specialty: ' + (specialty || 'not specified'),
+      'Hospital: ' + (hospital || 'not specified'),
+      'Product to pitch: ' + (product || 'Aranax medical products'),
+      past_interactions ? 'Past interactions: ' + past_interactions : '',
+    ].filter(Boolean).join('\n');
+
+    const prompt = 'You are a medical sales assistant for Aranax Medical. Write a short, professional, persuasive pitch a sales rep can use with a doctor. '
+      + 'Use ONLY the facts provided; do not invent clinical claims or data. Keep it under 120 words. '
+      + 'Structure: 1) a one-line hook tailored to the specialty, 2) 2-3 key benefits, 3) a clear next step. '
+      + 'Return ONLY the pitch text.\n\nFACTS:\n' + facts;
+
+    const result = await genModel.generateContent(prompt);
+    const pitch = result.response.candidates[0].content.parts[0].text.trim();
+    return res.json({ pitch });
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not generate pitch', detail: e.message });
+  }
+});
+
+// ---------- AI: MEETING NOTES SUMMARY (Vertex AI / Gemini) ----------
+app.post('/ai/mom-summary', async (req, res) => {
+  try {
+    const { notes } = req.body;
+    if (!notes || !notes.trim()) return res.status(400).json({ error: 'notes required' });
+    const prompt = 'You are a medical sales assistant. From these raw meeting notes, produce ONLY valid JSON with keys: '
+      + 'summary (2 sentences), sentiment (Positive/Neutral/Negative), next_steps (array of short strings), follow_up_email (a short professional email draft). '
+      + 'Use only what is in the notes; do not invent. No markdown.\n\nNOTES:\n' + notes;
+    const result = await genModel.generateContent(prompt);
+    let out = result.response.candidates[0].content.parts[0].text.trim().replace(/```json/g,'').replace(/```/g,'').trim();
+    let parsed; try { parsed = JSON.parse(out); } catch { parsed = { summary: out, sentiment: 'Neutral', next_steps: [], follow_up_email: '' }; }
+    return res.json(parsed);
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not summarize notes', detail: e.message });
+  }
+});
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log('Aranax API on ' + PORT));
